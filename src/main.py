@@ -1,8 +1,9 @@
 import logging
 logging.basicConfig(level=logging.INFO, format=' %(asctime)s -  %(levelname)s:  %(message)s')
 import os, time, numpy as np, pandas as pd, shutil, random, tensorflow as tf
-from datetime import datetime
+import matplotlib.pyplot as plt
 
+from datetime import datetime
 from recognize import get_vector, register_user, find_closest, detect_faces
 from utils.db_conn import PostgrePy
 
@@ -46,20 +47,26 @@ def fr_performance(pgcon, threshold:float, model, detect_faces:function):
     """
         Test biometric matching engine performance evaluation for a specific decision threshold
     """
-    trueVerif = 0
-    falseVerif = 0
-    fta = 0
+    trueMatch = 0 # predict = authorize, real = authorize
+    trueReject = 0 # predict = reject, real = reject
+    falseMatch = 0 # predict = authorize, real = reject
+    falseReject = 0 # predict = reject, real = authorize
     numTest = 0
     listRegistered = []
     listFetched = []
+    registered=True
 
-    # Recognize dir
-    recognizedir = 'data/recognize'
-
+    recognizedir = 'data/test/recognize'
     for user in os.listdir(recognizedir):
         numTest+=1
-        name = user.split("_")[0]
-        listRegistered.append(name)
+        nameRegistered = user.split("_")[0]
+        if nameRegistered[:3] == "CFD" or '-' in nameRegistered: # Check whether the given user is registered in DB
+            listRegistered.append(None)
+            registered = False
+        else:
+            listRegistered.append(nameRegistered)
+            registered=True
+
         fp = os.path.join(recognizedir, user)
 
         try:
@@ -67,25 +74,30 @@ def fr_performance(pgcon, threshold:float, model, detect_faces:function):
             data = find_closest(pgcon, user_vector.flatten(), threshold=threshold)
             data = data.get('data', None)
 
-            if data == None or len(data) == 0:
+            if (data == None or len(data) == 0) and not registered:
                 listFetched.append(None)
-                fta += 1
+                trueReject += 1
             else:
                 nameFetched=data[0][0]
                 listFetched.append(nameFetched)
-                if name == nameFetched:
-                    trueVerif+=1
+
+                if nameRegistered == nameFetched:
+                    trueMatch+=1
+                elif registered == False: # real: reject, predict: match
+                    falseMatch+=1
                 else:
-                    falseVerif+=1
+                    falseReject+=1 # real: match, predict: reject
         except:
             listFetched.append(None)
-            fta+=1
+            trueReject+=1
 
-
-    summaryDF = pd.DataFrame({'registered_as': listRegistered, 'fetched_as': listFetched, 'threshold': [threshold for _ in range(len(listFetched))]})
+    summaryDF = pd.DataFrame({'registered_as': listRegistered,
+                              'fetched_as': listFetched, 
+                              'threshold': [threshold for _ in range(len(listFetched))]
+                              })
     summaryDF.to_csv(f'./test_result/fr_performance_{threshold}.csv')
 
-    return numTest, trueVerif, falseVerif, fta
+    return numTest, trueMatch, trueReject, falseMatch, falseReject
 
 def threshold_benchmarking(pgcon, model, detect_faces:function, thres_range):
     """
@@ -93,41 +105,55 @@ def threshold_benchmarking(pgcon, model, detect_faces:function, thres_range):
 
         Output: FAR (False Acceptance Rate), FRR (False Rejection Rate)
     """
-
-    trueList = []
-    falseList = []
-    ftaList = []
+    tp = []
+    tn = []
+    fp = []
+    fn = []
     thresList = []
 
     for i, thres in enumerate(thres_range):
-        numTest, trueVerif, falseVerif, fta = fr_performance(pgcon, threshold=thres, model=model, detect_faces=detect_faces)
+        numTest, trueMatch, trueReject, falseMatch, falseReject = fr_performance(pgcon, threshold=thres, model=model, detect_faces=detect_faces)
         logging.info(f"""
         Test #{i}:
         
         Decision Threshold: {thres}
-        {trueVerif}/{numTest} succeed from the overall test with the decision threshold: {thres}\n
-        Number of match: {trueVerif}
-        Number of non-match: {falseVerif}
-        Number of FTA: {fta}
+        {trueMatch}/{numTest} recognized from the overall test with the decision threshold: {thres}\n
+        Number of True Match: {trueMatch}
+        Number of True Reject: {trueReject}
 
-        False Acceptance Rate: {round(trueVerif/numTest, 3)}\nFalse Rejection Rate: {round(falseVerif/numTest, 3)}
+        Number of False Match: {falseMatch}
+        Number of False Reject: {falseReject}
         """)
 
         thresList.append(thres)
-        trueList.append(trueVerif)
-        falseList.append(falseVerif)
-        ftaList.append(fta)
+        tp.append(trueMatch)
+        tn.append(trueReject)
+        fp.append(falseMatch)
+        fn.append(falseReject)
 
 
-    pd.DataFrame({'threshold': thresList, 'match': trueList, 'reject': falseList, 'fta': ftaList}).to_csv('./test_result/threshold_benchmarking.csv')
+    df = pd.DataFrame({
+        'threshold': thresList, 
+        'trueMatch': tp,
+        'trueReject': tn,
+        'falseMatch': fp,
+        'falseReject': fn
+    })
+
+    df['FAR'] = df['falseMatch']/(df['falseMatch'] + df['trueReject'])
+    df['FRR'] = df['falseReject']/(df['falseReject']+df['trueMatch'])
+    df.to_csv('./test_result/threshold_benchmarking.csv')
+    plt.plot(df['FAR'], df['FRR'])
+    plt.savefig('./threshold_benchmarking.png')
 
 if __name__ == '__main__':
     # STARTS HERE
-    # Specify the path to your model here ...
+    # Specify the path to your model here (tensorflow only) ...
     model_path = 'pre-trained/vggface2.h5'
+    # For non-tensorflow model, you need to override the function (Specify your own function)
     model = load_model(model_path)
 
-    # CREATE DATABASE FOR STORING BIOMETRIC TEMPLATE (FACE EMBEDDING) with the DDL query below:
+    # CREATE PG_VECTOR DATABASE FOR STORING BIOMETRIC TEMPLATE (FACE EMBEDDING) with the DDL query below:
     # -- DROP TABLE public.users;
 
     # CREATE TABLE public.users (
@@ -149,6 +175,15 @@ if __name__ == '__main__':
     # Specify users image directory path to be registered to the database ...
     enroldir = 'data/register'
     register(enroldir)
+
+    # Override necessary method here...
+    # def detect_faces(img: np.ndarray) -> tuple[int,int,int,int]:
+    #     """
+    #     Detect face from the given image parameter. Returning coordinates x,y,w,h
+    #     """
+    #     # Do face detection
+
+    #     return x, y, w, h
 
     # Check FR model performance on the registered biometric template
     threshold_benchmarking(pgcon=pgconnection, model=model, detect_faces=detect_faces, thres_range=np.arange(0.5, 1, 0.01))
